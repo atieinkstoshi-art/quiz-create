@@ -85,20 +85,23 @@ const S={screen:'title',name:'',qs:[],qi:0,score:0,correct:0,streak:0,maxStreak:
 const $=id=>document.getElementById(id);
 function shuffle(a){for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}return a;}
 function render(html){document.getElementById('screen').innerHTML=html;}
-async function gasPost(payload){
-  if(!GAS_URL||GAS_URL==='https://script.google.com/macros/s/AKfycbz8II6WD_N9LHYVBpq6-dV4YkQEgiJFUAUmPrD_SjYY49Lgbt3GSDvzOO8Gd3BGqvwJVw/exec')return{status:'local'};
-  try{const r=await fetch(GAS_URL,{method:'POST',body:JSON.stringify(payload)});return await r.json();}catch(e){return{status:'error'};}
-}
 async function saveResult(r){
-  const res=await gasPost({type:'save',result:r});
-  if(res.status!=='ok'){const all=JSON.parse(localStorage.getItem('quiz_results')||'[]');all.push(r);localStorage.setItem('quiz_results',JSON.stringify(all));}
+  const all=JSON.parse(localStorage.getItem('quiz_results')||'[]');
+  all.push(r);localStorage.setItem('quiz_results',JSON.stringify(all));
+  try{await fetch(GAS_URL,{method:'POST',mode:'no-cors',body:JSON.stringify({type:'save',result:r})});}catch(e){console.log('GAS save error:',e);}
 }
 async function loadAllResults(){
-  const res=await gasPost({type:'load'});
-  if(res.status==='ok')return res.students||[];
+  try{
+    const r=await fetch(GAS_URL+'?type=load',{method:'GET'});
+    const d=await r.json();
+    if(d&&d.status==='ok')return d.students||[];
+  }catch(e){console.log('GAS load error:',e);}
   return JSON.parse(localStorage.getItem('quiz_results')||'[]');
 }
-async function clearAllResults(){await gasPost({type:'clear'});localStorage.removeItem('quiz_results');}
+async function clearAllResults(){
+  localStorage.removeItem('quiz_results');
+  try{await fetch(GAS_URL,{method:'POST',mode:'no-cors',body:JSON.stringify({type:'clear'})});}catch(e){}
+}
 function makeChoices(q,allQs){
   const same=allQs.filter(x=>x.imgIdx===q.imgIdx&&x.id!==q.id);
   const other=allQs.filter(x=>x.imgIdx!==q.imgIdx&&x.id!==q.id);
