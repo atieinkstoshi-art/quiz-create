@@ -188,7 +188,7 @@ function answer(sel,btn){
     else if(b===btn&&!ok)b.classList.add('wrong');
     b.disabled=true;
   });
-  setTimeout(showQuestion,ok?900:1500);
+  S.qi++;setTimeout(showQuestion,ok?900:1500);
 }
 
 function timeUp(){
