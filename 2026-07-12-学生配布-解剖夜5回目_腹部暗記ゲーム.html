@@ -277,7 +277,7 @@ function organOf(block){ return (block==="肝区域")?"肝区域":(block==="男�
 function render(){
   if(S.screen){ renderScreen(); return; }
   const v=S.view;
-  if(!S.user && v!=="home"){ S.view="home"; }
+  if(!S.user && v!=="home" && v!=="teacher"){ S.view="home"; }
   if(S.view==="home") renderHome();
   else if(S.view==="memo") renderMemoHome();
   else if(S.view==="quiz") renderQuizHome();
