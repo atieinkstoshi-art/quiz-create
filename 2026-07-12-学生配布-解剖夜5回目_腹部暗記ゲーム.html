@@ -234,9 +234,26 @@ const LS = {
   get(k,d){ try{return JSON.parse(localStorage.getItem(k))??d;}catch(e){return d;} },
   set(k,v){ localStorage.setItem(k, JSON.stringify(v)); }
 };
-async function gasPost(payload){
-  try{ const r=await fetch(GAS_URL,{method:"POST",body:JSON.stringify(payload)}); return await r.json(); }
-  catch(e){ return {status:"error"}; }
+async function gasPost(payload, opt){
+  opt = opt || {};
+  const retries = (opt.retries!=null) ? opt.retries : 4;   // 書き込みは既定4回リトライ
+  const timeout = opt.timeout || 15000;                    // 15秒で必ず打ち切り（無限フリーズ防止）
+  for(let a=0; a<=retries; a++){
+    try{
+      const ctrl = new AbortController();
+      const tm = setTimeout(()=>ctrl.abort(), timeout);
+      const r = await fetch(GAS_URL, {method:"POST", body:JSON.stringify(payload), signal:ctrl.signal});
+      clearTimeout(tm);
+      const j = await r.json();
+      // サーバーが混雑中(busy)なら少し待って再送。それ以外は結果を返す
+      if(j && j.status==="busy" && a < retries){ await new Promise(res=>setTimeout(res, 600*(a+1) + Math.random()*700)); continue; }
+      return j;
+    }catch(e){
+      if(a < retries){ await new Promise(res=>setTimeout(res, 600*(a+1) + Math.random()*700)); continue; } // バックオフ＋ジッター
+      return {status:"error"};
+    }
+  }
+  return {status:"error"};
 }
 const Store = {
   async saveResult(r){
@@ -258,6 +275,12 @@ const Store = {
   async loadTeams(){ if(GAS_URL){ const r=await gasPost({type:"team_agg"}); return (r&&r.status==="ok")?r.teams||{}:{}; } return LS.get("teamTotals",{}); },
   async loadOrgans(){ if(GAS_URL){ const r=await gasPost({type:"team_agg"}); return (r&&r.status==="ok")?r.organs||{}:{}; } return LS.get("organTotals",{}); },
   async loadCoop(){ if(GAS_URL){ const r=await gasPost({type:"class_total"}); return (r&&r.status==="ok")?r.total||0:0; } return LS.get("coopTotal",0); },
+  // teams+organs+total を1回で取得（スクリーン/協力/ダッシュボード共通・読み取りは軽く1回リトライ）
+  async loadState(){
+    if(GAS_URL){ const r=await gasPost({type:"state"},{retries:1,timeout:8000});
+      return (r&&r.status==="ok") ? {teams:r.teams||{}, organs:r.organs||{}, total:r.total||0} : null; }
+    return {teams:LS.get("teamTotals",{}), organs:LS.get("organTotals",{}), total:LS.get("coopTotal",0)};
+  },
   async clearAll(){ if(GAS_URL){ await gasPost({type:"clear"}); } localStorage.removeItem("results"); localStorage.removeItem("teamTotals"); localStorage.removeItem("organTotals"); localStorage.removeItem("coopTotal"); }
 };
 
@@ -265,6 +288,8 @@ const Store = {
    状態・ユーティリティ
    ============================================================ */
 let S = { view:"home", user:LS.get("user",null), team:LS.get("team",1) };
+let coopKnown = 0;      // 直近に把握した協力合計（楽観表示に使う）
+let lastScreen = null;  // スクリーンの最後に成功した値（通信失敗時のちらつき防止）
 const $ = s=>document.getElementById(s);
 function esc(t){ return (""+t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function shuffle(a){ a=a.slice(); for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
@@ -510,10 +535,11 @@ async function endQuiz(){
   const pct=Math.round(Q.correct/Q.qs.length*100);
   const rec={ name:S.user, team:S.team, block:Q.block, mode:Q.mode, score:Q.score, correct:Q.correct,
     total:Q.qs.length, pct, maxStreak:Q.maxStreak, time:Date.now(), answers:Q.answers };
-  await Store.saveResult(rec);
+  // 書き込みは待たない（内部で自動リトライ）＝画面をフリーズさせない
+  Store.saveResult(rec);
 
   if(Q.mode==="team"){
-    await Store.addTeam(S.team, Q.correct, organOf(Q.block));
+    Store.addTeam(S.team, Q.correct, organOf(Q.block));
     setScreen(`
       <div class="hd"><div class="t">⚔️ チームに加点！</div><span class="pill">チーム${S.team}</span></div>
       <div class="card" style="text-align:center"><p style="font-size:40px;margin:4px">➕${Q.correct}</p>
@@ -524,15 +550,17 @@ async function endQuiz(){
     return;
   }
   if(Q.mode==="coop"){
-    await Store.addCoop(Q.correct);
-    const total=await Store.loadCoop();
+    Store.addCoop(Q.correct);
+    coopKnown += Q.correct;                       // 楽観的に自分の分を足して即表示
     setScreen(`
       <div class="hd"><div class="t">🤝 クラスに貢献！</div></div>
       <div class="card" style="text-align:center"><p style="font-size:40px;margin:4px">➕${Q.correct}</p>
         <p>あなたの正解がクラス合計に加わりました。</p></div>
-      ${gaugeHtml(total)}
+      <div id="coopGauge">${gaugeHtml(coopKnown)}</div>
       <button class="btn" onclick="go('coop')">もう1ラウンド</button>
       <button class="btn ghost" onclick="go('home')">ホームへ</button>`);
+    // 少し待ってサーバの実値でゲージを更新（失敗しても楽観値のまま）
+    setTimeout(async ()=>{ const d=await Store.loadState(); if(d){ coopKnown=Math.max(coopKnown,d.total); const g=$("coopGauge"); if(g) g.innerHTML=gaugeHtml(coopKnown); } }, 2000);
     return;
   }
   // solo: 過去比の伸びのみ（順位は出さない）
@@ -582,7 +610,9 @@ function renderTeamHome(){
 
 /* ---------- 協力メニュー ---------- */
 async function renderCoopHome(){
-  const total=await Store.loadCoop();
+  const d=await Store.loadState();
+  const total = d ? d.total : coopKnown;   // 通信失敗時は直近の把握値
+  coopKnown = Math.max(coopKnown, total);
   setScreen(`
     <div class="hd"><div class="t">🤝 協力モード</div></div>
     <div class="banner">クラス全員の正解を合計して、目標 <b>${COOP_TARGET}</b> を達成すればクラス勝利！ 速い遅いは関係なし、1問正解＝1貢献。</div>
@@ -603,9 +633,10 @@ function gaugeHtml(total){
    4秒ごとにチーム合算・器官点灯・協力ゲージを更新
    ============================================================ */
 async function renderScreen(){
-  const teams=await Store.loadTeams();
-  const organs=await Store.loadOrgans();
-  const coop=await Store.loadCoop();
+  const d=await Store.loadState();
+  if(d) lastScreen=d;                 // 成功時だけ更新。失敗時は前の値を保持＝0にちらつかない
+  const src = lastScreen || {teams:{},organs:{},total:0};
+  const teams=src.teams, organs=src.organs, coop=src.total;
   const max=Math.max(10, ...Object.values(teams).map(Number));
   let bars="";
   for(let i=1;i<=TEAM_COUNT;i++){ const v=teams[i]||0; const w=Math.round(v/max*100);
@@ -646,8 +677,9 @@ function renderTeacher(){
 function authT(){ if($("pw").value===ADMIN_PW){ T.auth=true; paintTeacher(); } else alert("パスワードが違います"); }
 async function paintTeacher(){
   const results=await Store.loadResults();
-  const teams=await Store.loadTeams();
-  const coop=await Store.loadCoop();
+  const st=await Store.loadState();
+  const teams = st ? st.teams : {};
+  const coop  = st ? st.total : 0;
   const tabs=[["teams","チーム/概況"],["items","問題別正答率"],["students","個人（内部）"]];
   let body="";
   if(T.tab==="teams"){
@@ -703,7 +735,7 @@ async function wipe(){ if(confirm("全データを削除します。よろしい
    ============================================================ */
 function boot(){
   const p=new URLSearchParams(location.search);
-  if(p.get("screen")==="1"){ document.body.classList.add("screen"); S.screen=true; renderScreen(); setInterval(renderScreen, 4000); return; }
+  if(p.get("screen")==="1"){ document.body.classList.add("screen"); S.screen=true; renderScreen(); setInterval(renderScreen, 7000); return; }
   if(p.get("teacher")==="1"){ S.view="teacher"; }
   render();
 }
