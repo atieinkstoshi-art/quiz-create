@@ -87,6 +87,19 @@
     font-weight:800;font-size:12px;cursor:pointer;}
   .seg button.on{background:var(--blue);border-color:var(--blue);color:#fff;}
   .fbcard{text-align:center;border-radius:14px;padding:14px;margin:10px 0;border:2px solid var(--line);}
+  /* 教員：問題別タブ（デブリーフ用に問題文を全文＋タップで解説） */
+  .qitem{border:1px solid var(--line);border-radius:10px;margin:7px 0;cursor:pointer;background:var(--card);}
+  .qitem.open{border-color:var(--blue);box-shadow:0 0 0 2px rgba(24,95,165,.15);}
+  .qhead{display:flex;gap:9px;align-items:flex-start;padding:9px 11px;}
+  .qrank{flex:none;width:24px;font-weight:900;font-size:14px;text-align:center;color:var(--ng);}
+  .qtxt{flex:1;min-width:0;}
+  .qq{font-size:13.5px;line-height:1.5;margin-top:3px;}
+  .qpct{flex:none;width:56px;text-align:right;font-weight:800;font-size:13px;}
+  .qbody{padding:0 11px 11px;border-top:1px dashed var(--line);margin-top:2px;padding-top:9px;}
+  .qch{font-size:13px;padding:5px 8px;border-radius:7px;margin:3px 0;background:var(--bg);}
+  .qch.ok{background:rgba(59,109,17,.14);color:var(--ok);font-weight:800;}
+  .qexp{margin-top:8px;font-size:13px;line-height:1.6;background:rgba(24,95,165,.07);
+    border-radius:8px;padding:9px 11px;}
   /* ---- 覚えることリスト ---- */
   .mlbar{display:flex;align-items:center;gap:8px;margin:4px 0 8px;}
   .mlbar .track{flex:1;height:10px;border-radius:999px;background:var(--line);overflow:hidden;}
@@ -521,10 +534,14 @@ const Store = {
     LS.set("phaseSrv", p); return {status:"ok"};
   },
   async teamAct(action, teamId, teamName, nick){
-    if(HAS_GAS){ await gasPost({type:"team_act", action, teamId, teamName, nick}); }
-    else{
-      const a=LS.get("teamLog",[]); a.push({action, teamId, teamName, nick}); LS.set("teamLog",a);
+    if(HAS_GAS){
+      // チーム編成は40名が一斉に叩くのでロックが枯渇しやすい。書き込みは粘る＋結果を返す。
+      // 返さないと「自分の画面にはチームがあるのに、他の人の一覧には出ない」状態になる。
+      return await gasPost({type:"team_act", action, teamId, teamName, nick},
+                           {retries:5, timeout:30000});
     }
+    const a=LS.get("teamLog",[]); a.push({action, teamId, teamName, nick}); LS.set("teamLog",a);
+    return {status:"ok"};
   },
   // 学生端末が20秒ごとに叩く軽量ポーリング（読み取りは詰まったら即あきらめる）
   async loadState(){
@@ -634,8 +651,15 @@ async function pollPhase(){
   const tChanged = (d.tseq||0) !== PH.tseq; PH.tseq = d.tseq||0;
   const sChanged = (d.sseq||0) !== PH.sseq; PH.sseq = d.sseq||0;
   if(prev !== PH.cur){ onPhaseChange(prev, PH.cur); return; }
+  // 自動再描画はクイズ中に絶対にやらない。
+  // 作戦タイム中に練習クイズを解いている学生は S.view==="teamstudy" のままなので、
+  // 誰かが提出するたびに render() が走ると回答画面が消えてしまう（7/29の「表示されない」の一因）。
+  if(Q && Q.timer) return;
   if(tChanged && S.view==="teams"){ renderTeams(); }
-  if(sChanged && (S.view==="result"||S.view==="teamstudy")){ render(); }
+  // 40名分の提出のたびに全員が standings を読み直すと負荷が跳ねるので、30秒に1回までに間引く
+  if(sChanged && (S.view==="result"||S.view==="teamstudy")){
+    if(Date.now() - LAST_AUTOPAINT > 30000){ LAST_AUTOPAINT = Date.now(); render(); }
+  }
 }
 function onPhaseChange(from, to){
   // 進行中のクイズは絶対に殺さない（教員が誤って巻き戻しても回答中の学生を落とさない）
@@ -834,6 +858,8 @@ async function paintRoster(locked){
       <div style="font-weight:800;margin-bottom:6px">① チームを新しく作る（代表の人だけ）</div>
       <input class="txt" id="tname" placeholder="例：血管マスターズ" maxlength="12" style="margin-bottom:8px">
       <button class="btn" onclick="createTeam()">このチームを作る ▶</button>
+      <div id="twait" style="display:none" class="muted" style="font-size:12px;text-align:center">
+        送信中… そのままお待ちください</div>
     </div>
     <div class="card">
       <div style="font-weight:800;margin-bottom:6px">② できているチームに入る（タップするだけ）</div>
@@ -850,21 +876,43 @@ async function paintRoster(locked){
     <p class="muted" style="font-size:11px;text-align:center" onclick="reIdent()">別の名前で入り直す</p>
   `;
 }
+let TEAM_BUSY = false;   // 連打で二重に作らせない
 async function createTeam(){
+  if(TEAM_BUSY) return;
   const nm = sanitizeName($("tname").value);
   if(!nm){ alert("チーム名を入れてください"); return; }
+  TEAM_BUSY = true;
+  const el = $("tname"); if(el) el.disabled = true;
+  const wait = $("twait"); if(wait) wait.style.display = "block";
   const tid = newTeamId();
+  // ★ サーバに書けたことを確認してからローカルに保存する ★
+  //   先にローカルへ入れると、書き込みが失敗しても自分の画面には「自分のチーム」が出続け、
+  //   他の学生の一覧には出ないので「作れたのに誰も入れない」状態になる（7/29の授業で発生）。
+  const r = await Store.teamAct("create", tid, nm, S.user);
+  TEAM_BUSY = false;
+  if(el) el.disabled = false;
+  if(wait) wait.style.display = "none";
+  if(HAS_GAS && (!r || r.status !== "ok")){
+    alert("⚠ チームの作成がサーバに届きませんでした。\n通信を確認して、もう一度「このチームを作る」を押してください。");
+    return;
+  }
   S.teamId = tid; S.teamName = nm;
   LS.set("teamId", tid); LS.set("teamName", nm);
-  await Store.teamAct("create", tid, nm, S.user);
   await paintRoster(curPhase()>=1);
 }
 async function joinTeam(tid){
+  if(TEAM_BUSY) return;
   const t = (ROSTER.teams||[]).find(x=>x.id===tid);
   if(!t){ alert("そのチームが見つかりません"); return; }
+  TEAM_BUSY = true;
+  const r = await Store.teamAct("join", t.id, t.name, S.user);
+  TEAM_BUSY = false;
+  if(HAS_GAS && (!r || r.status !== "ok")){
+    alert("⚠ 参加がサーバに届きませんでした。\n通信を確認して、もう一度チームをタップしてください。");
+    return;
+  }
   S.teamId = t.id; S.teamName = t.name;
   LS.set("teamId", t.id); LS.set("teamName", t.name);
-  await Store.teamAct("join", t.id, t.name, S.user);
   await paintRoster(curPhase()>=1);
 }
 async function autoJoin(){
@@ -882,7 +930,10 @@ async function joinByCode(){
 }
 async function leaveTeam(){
   if(!confirm("このチームを抜けます。よろしいですか？")) return;
-  await Store.teamAct("leave", S.teamId, S.teamName, S.user);
+  const r = await Store.teamAct("leave", S.teamId, S.teamName, S.user);
+  if(HAS_GAS && (!r || r.status !== "ok")){
+    alert("⚠ 退出がサーバに届きませんでした。もう一度お試しください。"); return;
+  }
   S.teamId=null; S.teamName=null;
   LS.del("teamId","teamName");
   await paintRoster(curPhase()>=1);
@@ -1499,6 +1550,7 @@ function mlToggle(qid){
   mlRefreshCounts();
 }
 let ML = { filter:"all", hide:false, open:{} };
+let LAST_AUTOPAINT = 0;
 
 /* 表示する項目を、ブロック→（図ごと）にまとめて返す */
 function mlSections(){
@@ -1665,7 +1717,7 @@ async function renderScreen(){
 /* ============================================================
    教員ダッシュボード（?teacher=1）
    ============================================================ */
-let T={auth:false, tab:"phase"};
+let T={auth:false, tab:"phase", openQ:null};
 function renderTeacher(){
   if(!T.auth){
     setScreen(`<div class="hd"><div class="t">🔒 教員ダッシュボード</div></div>
@@ -1771,11 +1823,30 @@ async function paintTeacher(){
     results.forEach(r=>(r.answers||[]).forEach(a=>{ stat[a.id]=stat[a.id]||{ok:0,n:0}; stat[a.id].n++; if(a.ok)stat[a.id].ok++; }));
     const rows=QUESTIONS.map(q=>{ const s=stat[q.id]||{ok:0,n:0}; const p=s.n?Math.round(s.ok/s.n*100):null; return {q,p,n:s.n}; })
       .filter(r=>r.n>0).sort((a,b)=>a.p-b.p);
-    body=`<div class="banner">正答率が低い順（デブリーフはこのTOPから）</div>
-      <table class="dash"><tr><th>問題</th><th class="n">正答率</th><th class="n">n</th></tr>
-      ${rows.length?rows.map((r,idx)=>`<tr><td>${idx<5?'🔴 ':''}${lvlPill(r.q.level)} ${esc((r.q.tag||BLOCK_NAME[r.q.block]||""))} ${esc(r.q.q.slice(0,22))}…</td>
-        <td class="n">${r.p}%<div class="barmini"><i style="width:${r.p}%"></i></div></td><td class="n">${r.n}</td></tr>`).join("")
-      :`<tr><td colspan="3" class="muted">まだ回答がありません</td></tr>`}</table>`;
+    // デブリーフ用：問題文は全文出す。タップで図・選択肢・正答・解説を開く。
+    body=`<div class="banner">正答率が低い順。<b>行をタップすると問題と解説が開きます</b>（デブリーフはこのTOPから）</div>
+      ${rows.length? rows.map((r,idx)=>{
+        const open = T.openQ === r.q.id;
+        const q = r.q;
+        return `<div class="qitem ${open?'open':''}" onclick="T.openQ=${open?'null':q.id};paintTeacher()">
+          <div class="qhead">
+            <div class="qrank">${idx<5?'🔴':(idx+1)}</div>
+            <div class="qtxt">${lvlPill(q.level)}<span class="muted" style="font-size:11px">${esc(q.tag||BLOCK_NAME[q.block]||"")}</span>
+              <div class="qq">${esc(q.q).replace(/\n/g,"<br>")}</div></div>
+            <div class="qpct">${r.p}%<div class="barmini"><i style="width:${r.p}%"></i></div>
+              <div class="muted" style="font-size:10px">n=${r.n}</div></div>
+          </div>
+          ${open?`<div class="qbody">
+            ${q.img!=null&&IMAGES[q.img]?`<div style="text-align:center"><img src="${IMAGES[q.img]}" alt="図"
+              style="max-width:100%;max-height:44vh;border-radius:8px" onclick="event.stopPropagation();zoomImg(${q.img})"></div>`:""}
+            <div style="margin-top:8px">
+              ${q.choices.map((c,i)=>`<div class="qch ${q.ans.includes(i)?'ok':''}">
+                ${q.ans.includes(i)?'⭕':'　'} ${esc(c)}</div>`).join("")}
+            </div>
+            ${q.explain?`<div class="qexp"><b>💡 解説</b><br>${esc(q.explain).replace(/\n/g,"<br>")}</div>`:""}
+          </div>`:""}
+        </div>`;}).join("")
+      :`<p class="muted">まだ回答がありません</p>`}`;
   }
 
   setScreen(`
