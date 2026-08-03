@@ -716,7 +716,7 @@ function waitScreen(msg, sub){
 function render(){
   if(S.screen){ renderScreen(); return; }
   const v = S.view;
-  if(!S.user && v!=="teacher"){ renderJoin(); drawNav(); return; }
+  if(!S.user && v!=="teacher" && v!=="memlist"){ renderJoin(); drawNav(); return; }
   if(v!=="teacher" && v!=="me" && !viewAllowed(v)){ S.view = defaultViewFor(curPhase()); }
   const r = {teams:renderTeams, pre:renderPre, memo:renderMemoHome, teamstudy:renderTeamStudy,
              post:renderPost, result:renderResult, me:renderMe, teacher:renderTeacher,
@@ -1913,6 +1913,14 @@ function boot(){
   if(p.get("screen")==="1"){
     document.body.classList.add("screen"); S.screen=true;
     (async function loop(){ await renderScreen(); setTimeout(loop, 7000); })();
+    return;
+  }
+  if(p.get("list")==="1"){
+    // 覚えることリストだけを直接開く。名前もチーム登録も要らず、家からそのまま使える。
+    S.view="memlist"; render(); schedulePoll();
+    document.addEventListener("visibilitychange", ()=>{
+      if(!document.hidden){ pollPhase().then(schedulePoll); } else if(PH.timer){ clearTimeout(PH.timer); PH.timer=null; }
+    });
     return;
   }
   if(p.get("teacher")==="1"){
