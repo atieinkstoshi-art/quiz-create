@@ -725,7 +725,7 @@ function render(){
   drawNav();
 }
 function drawNav(){
-  if(S.screen){ $("nav").style.display="none"; return; }
+  if(S.screen || S.listOnly){ $("nav").style.display="none"; return; }
   if(!S.user){ $("nav").style.display="none"; return; }
   $("nav").style.display="flex";
   const items=[["teams","👥","チーム"],["pre","📋","実力"],["memo","🃏","暗記"],
@@ -1589,6 +1589,11 @@ function mlRefreshCounts(){
   const bar = $("mlAll"); if(bar) bar.style.width = (st.tot ? st.done/st.tot*100 : 0) + "%";
   const num = $("mlAllNum"); if(num) num.textContent = `${st.done} / ${st.tot}`;
 }
+function exitListOnly(){
+  S.listOnly = false;
+  S.view = S.user ? defaultViewFor(curPhase()) : "home";
+  render();
+}
 function mlSetFilter(f){ ML.filter = f; renderMemList(); }
 function mlToggleHide(){ ML.hide = !ML.hide; renderMemList(); }
 function mlToggleSec(k){ ML.open[k] = !ML.open[k]; renderMemList(); }
@@ -1652,6 +1657,9 @@ function renderMemList(){
       </div>
     </div>
     ${body || '<div class="card"><p class="muted" style="margin:0">全部チェックできています！ 🎉</p></div>'}
+    ${S.listOnly
+      ? `<button class="btn" onclick="exitListOnly()">▶ アプリを開く（クイズ・チーム戦）</button>`
+      : `<button class="btn ghost" onclick="go('memo')">◀ 暗記メニューにもどる</button>`}
     <button class="btn ghost sm" onclick="mlReset()">チェックを全部外す</button>
     <p class="muted" style="font-size:11px;text-align:center">
       チェックは覚えた目印です。得点には関係しません。</p>
@@ -1917,7 +1925,9 @@ function boot(){
   }
   if(p.get("list")==="1"){
     // 覚えることリストだけを直接開く。名前もチーム登録も要らず、家からそのまま使える。
-    S.view="memlist"; render(); schedulePoll();
+    // listOnly のあいだは下部ナビを出さない。出すと他のタブへ移れてしまい、
+    // ナビに「リスト」が無いため戻ってこられなくなる（学生から報告・2026-08-03）。
+    S.view="memlist"; S.listOnly=true; render(); schedulePoll();
     document.addEventListener("visibilitychange", ()=>{
       if(!document.hidden){ pollPhase().then(schedulePoll); } else if(PH.timer){ clearTimeout(PH.timer); PH.timer=null; }
     });
